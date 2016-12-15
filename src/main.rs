@@ -17,7 +17,7 @@ extern crate gfx_window_glutin;
 extern crate gfx_window_dxgi;
 
 pub use app::ColorFormat;
-use gfx::{Bundle, Primitive, ShaderSet, buffer, Bind, Slice};
+use gfx::{Bundle, Primitive, ShaderSet, buffer, Bind, Slice, texture};
 use gfx::state::Rasterizer;
 use std::thread;
 use std::time::Duration;
@@ -30,15 +30,25 @@ pub mod fluid;
 
 pub type TexFormat = [f32; 4];
 
-gfx_defines!{
+gfx_defines! {
     vertex Vertex {
         pos: [f32; 2] = "a_Pos",
         color: [f32; 4] = "a_Color",
     }
+    vertex Vertex2 {
+        pos: [f32; 2] = "a_Pos",
+        uv: [f32; 2] = "a_TexCoord",
+    }
 
     pipeline particles {
         vbuf: gfx::VertexBuffer<Vertex> = (),
-        out: gfx::BlendTarget<ColorFormat> = ("Target0", gfx::state::ColorMask::all(), gfx::preset::blend::ALPHA),
+        out: gfx::BlendTarget<ColorFormat> = ("Target0", gfx::state::ColorMask::all(), gfx::preset::blend::ADD),
+    }
+
+    pipeline display {
+        vbuf: gfx::VertexBuffer<Vertex2> = (),
+        src: gfx::TextureSampler<[f32; 4]> = "t_Src",
+        out: gfx::RenderTarget<ColorFormat> = "Target0",
     }
 }
 
@@ -51,8 +61,18 @@ impl Vertex {
     }
 }
 
+impl Vertex2 {
+    fn new(p: [f32; 2], uv: [f32; 2]) -> Vertex2 {
+        Vertex2 {
+            pos: p,
+            uv: uv,
+        }
+    }
+}
+
 struct App<R: gfx::Resources> {
     particles: Bundle<R, particles::Data<R>>,
+    display: Bundle<R, display::Data<R>>,
     system: ParticleSystem,
     vertex_data: Vec<Vertex>,
     time_start: Instant,
@@ -69,7 +89,7 @@ impl<R: gfx::Resources> app::Application<R> for App<R> {
     fn new<F: gfx::Factory<R>>(mut factory: F, init: app::Init<R>) -> Self {
         use gfx::traits::FactoryExt;
 
-        let (_width, _height, _, _) = init.color.get_dimensions();
+        let (width, height, _, _) = init.color.get_dimensions();
 
         let vs = shade::Source {
             hlsl_40:  include_bytes!("../data/vs_particle.fx"),
@@ -81,6 +101,14 @@ impl<R: gfx::Resources> app::Application<R> for App<R> {
         };
         let ps = shade::Source {
             hlsl_40:  include_bytes!("../data/ps_particle.fx"),
+            .. shade::Source::empty()
+        };
+        let vs_display = shade::Source {
+            hlsl_40:  include_bytes!("../data/vs_display.fx"),
+            .. shade::Source::empty()
+        };
+        let ps_display = shade::Source {
+            hlsl_40:  include_bytes!("../data/ps_display.fx"),
             .. shade::Source::empty()
         };
 
@@ -99,6 +127,28 @@ impl<R: gfx::Resources> app::Application<R> for App<R> {
             ps.select(init.backend).unwrap(),
         );
 
+        let sampler = factory.create_sampler(
+            texture::SamplerInfo::new(texture::FilterMethod::Scale, texture::WrapMode::Clamp)
+        );
+        let vertex_data2 = [
+            Vertex2::new([-1.0, -1.0], [0.0, 1.0]),
+            Vertex2::new([1.0, -1.0], [1.0, 1.0]),
+            Vertex2::new([-1.0, 1.0], [0.0, 0.0]),
+            Vertex2::new([-1.0, 1.0], [0.0, 0.0]),
+            Vertex2::new([1.0, -1.0], [1.0, 1.0]),
+            Vertex2::new([1.0, 1.0], [1.0, 0.0]),
+        ];
+
+        let (vbuf2, slice2) = factory.create_vertex_buffer_with_slice(&vertex_data2, ());
+
+        let display_pso = factory.create_pipeline_simple(
+            vs_display.select(init.backend).unwrap(),
+            ps_display.select(init.backend).unwrap(),
+            display::new()
+        ).unwrap();
+
+        let (_ , srv, rtv) = factory.create_render_target(width, height).expect("Failed to create render target");
+
         println!("Backend: {:?}", init.backend);
 
         let pso = factory.create_pipeline_state(
@@ -110,11 +160,19 @@ impl<R: gfx::Resources> app::Application<R> for App<R> {
 
         let data = particles::Data {
             vbuf: vbuf.clone(),
+            out: rtv,
+            //out: init.color.clone(),
+        };
+
+        let data2 = display::Data {
+            vbuf: vbuf2.clone(),
+            src: (srv, sampler),
             out: init.color,
         };
 
         App {
             particles: Bundle::new(slice.clone(), pso, data),
+            display: Bundle::new(slice2.clone(), display_pso, data2),
             system: system,
             vertex_data: vertex_data,
             time_start: Instant::now(),
@@ -150,10 +208,14 @@ impl<R: gfx::Resources> app::Application<R> for App<R> {
             v.color[1] = d.density*0.01;
         }
 
-        encoder.clear(&self.particles.data.out, [0.1, 0.2, 0.3, 1.0]);
+        encoder.clear(&self.particles.data.out, [0.0, 0.0, 0.0, 1.0]);
         encoder.update_buffer(&self.particles.data.vbuf, &self.vertex_data, 0).unwrap();
 
         self.particles.encode(encoder);
+
+        encoder.clear(&self.display.data.out, [0.0, 0.0, 0.0, 1.0]);
+        self.display.encode(encoder);
+        
         thread::sleep(Duration::from_millis(1));
     }
 }
